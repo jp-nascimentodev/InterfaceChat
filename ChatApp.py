@@ -16,6 +16,9 @@ class ChatApp(ctk.CTk):
         self.contato_alvo_atual = None 
         self.aguardando_login = False
         self.aguardando_registro = False
+        
+        self.timer_digitando = None
+        self.esta_digitando = False
 
         self.title("Fala Aí - Projeto Chat")
         self.geometry("400x500")
@@ -35,7 +38,6 @@ class ChatApp(ctk.CTk):
         self.destroy()
 
     def _carregar_historico_na_tela(self, contato):
-        """Busca o histórico no cliente_db e injeta na interface"""
         historico = buscar_historico(self.usuario_atual, contato)
         for tipo, msg in historico:
             if tipo == 'enviada':
@@ -43,9 +45,6 @@ class ChatApp(ctk.CTk):
             else:
                 self._inserir_mensagem_na_tela(f"{contato}: {msg}")
 
-    # ==========================================
-    # LÓGICA DE RECEPÇÃO ASSÍNCRONA
-    # ==========================================
     def _thread_recebimento(self):
         while True:
             try:
@@ -63,17 +62,30 @@ class ChatApp(ctk.CTk):
             self._atualizar_lista_contatos_ui(pacote)
             return
 
-        if pacote.get("acao") == "enviar_mensagem":
+        acao = pacote.get("acao")
+
+        if acao == "enviar_mensagem":
             remetente = pacote.get("remetente")
             mensagem = pacote.get("mensagem")
-            
             salvar_mensagem_local(self.usuario_atual, remetente, "recebida", mensagem)
             
             if self.contato_alvo_atual == remetente:
                 self._inserir_mensagem_na_tela(f"{remetente}: {mensagem}")
             return
 
-        if pacote.get("acao") == "confirmacao":
+        if acao == "digitando":
+            remetente = pacote.get("remetente")
+            if self.contato_alvo_atual == remetente and hasattr(self, 'label_digitando') and self.label_digitando.winfo_exists():
+                self.label_digitando.configure(text=f"{remetente} está digitando...")
+            return
+
+        if acao == "parou_digitando":
+            remetente = pacote.get("remetente")
+            if self.contato_alvo_atual == remetente and hasattr(self, 'label_digitando') and self.label_digitando.winfo_exists():
+                self.label_digitando.configure(text="")
+            return
+
+        if acao == "confirmacao":
             if pacote.get("status") == "offline":
                 self._inserir_mensagem_na_tela("[Sistema: Destinatário offline. Mensagem guardada]")
             return
@@ -98,9 +110,6 @@ class ChatApp(ctk.CTk):
                     messagebox.showerror("Erro", "Esse nome já está em uso.")
             return
 
-    # ==========================================
-    # LÓGICA DE ENVIO E ATUALIZAÇÃO
-    # ==========================================
     def fazer_login(self):
         user = self.entry_user.get()
         password = self.entry_senha.get()
@@ -161,9 +170,6 @@ class ChatApp(ctk.CTk):
                                      command=lambda c=nome: self.abrir_chat(self.usuario_atual, c))
             btn_chat.pack(side="right", padx=10)
 
-    # ==========================================
-    # CONSTRUÇÃO DAS TELAS DA INTERFACE
-    # ==========================================
     def tela_login(self):
         for widget in self.winfo_children(): widget.destroy()
 
@@ -216,16 +222,40 @@ class ChatApp(ctk.CTk):
         self.caixa_mensagens = ctk.CTkTextbox(self, width=350, height=320, state="disabled", wrap="word")
         self.caixa_mensagens.pack(pady=10, padx=20, fill="both", expand=True)
 
+        self.label_digitando = ctk.CTkLabel(self, text="", font=("Roboto", 12, "italic"), text_color="#A0A0A0")
+        self.label_digitando.pack(anchor="w", padx=25)
+
         frame_base = ctk.CTkFrame(self, fg_color="transparent")
         frame_base.pack(fill="x", pady=(0, 10), padx=20)
 
         self.entry_msg = ctk.CTkEntry(frame_base, placeholder_text="Mensagem...", width=260, height=40)
         self.entry_msg.pack(side="left", padx=(0, 10))
+        
         self.entry_msg.bind("<Return>", lambda event: self._enviar_mensagem_chat(contato_alvo))
+        self.entry_msg.bind("<KeyRelease>", lambda event: self._tecla_pressionada(contato_alvo, event))
 
         ctk.CTkButton(frame_base, text="Enviar", width=80, height=40, command=lambda: self._enviar_mensagem_chat(contato_alvo)).pack(side="right")
 
         self._carregar_historico_na_tela(contato_alvo)
+
+    def _tecla_pressionada(self, destinatario, event):
+        if event.keysym == 'Return': 
+            return
+        
+        if not self.esta_digitando:
+            self.esta_digitando = True
+            dado = {"acao": "digitando", "remetente": self.usuario_atual, "destinatario": destinatario}
+            self.client_socket.sendall(json.dumps(dado).encode())
+        
+        if self.timer_digitando:
+            self.after_cancel(self.timer_digitando)
+        
+        self.timer_digitando = self.after(2000, lambda: self._parou_de_digitar(destinatario))
+
+    def _parou_de_digitar(self, destinatario):
+        self.esta_digitando = False
+        dado = {"acao": "parou_digitando", "remetente": self.usuario_atual, "destinatario": destinatario}
+        self.client_socket.sendall(json.dumps(dado).encode())
 
     def _inserir_mensagem_na_tela(self, texto):
         if hasattr(self, 'caixa_mensagens') and self.caixa_mensagens.winfo_exists():
@@ -237,9 +267,12 @@ class ChatApp(ctk.CTk):
     def _enviar_mensagem_chat(self, destinatario):
         mensagem = self.entry_msg.get()
         if not mensagem.strip(): return
+        
+        if self.timer_digitando:
+            self.after_cancel(self.timer_digitando)
+        self._parou_de_digitar(destinatario)
 
         salvar_mensagem_local(self.usuario_atual, destinatario, "enviada", mensagem)
-
         self._inserir_mensagem_na_tela(f"Você: {mensagem}")
         self.entry_msg.delete(0, 'end')
 
